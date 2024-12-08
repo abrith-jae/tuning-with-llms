@@ -1,0 +1,332 @@
+pip3 install -qq datasets
+pip3 install trl
+pip3 install transformers
+pip3 install peft
+pip3 install tqdm
+pip3 install numpy
+pip3 install pandas
+pip3 install matplotlib
+pip3 install seaborn
+pip3 install scikit-learn
+pip3 install sacrebleu
+pip3 install evaluate
+
+
+import warnings
+warnings.filterwarnings('ignore')
+warnings.simplefilter('ignore')
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from datasets import load_dataset
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+import evaluate
+from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
+
+from peft import get_peft_model, LoraConfig, TaskType
+
+import pickle
+import json
+import matplotlib.pyplot as plt 
+
+from urllib.request import urlopen
+import io
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+dataset = load_dataset("lucasmccabe-lmi/CodeAlpaca-20k", split="train")
+dataset
+
+
+dataset[1000]
+
+
+dataset = dataset.filter(lambda example: example["input"] == '')
+
+
+dataset = dataset.shuffle(seed=42)
+
+
+dataset
+
+
+dataset_split = dataset.train_test_split(test_size=0.2, seed=42)
+train_dataset = dataset_split['train']
+test_dataset = dataset_split['test']
+dataset_split
+
+
+# Select a small set of data for the resource limitation
+# This dataset will be only used for evaluation parts, not for the training
+tiny_test_dataset=test_dataset.select(range(10))
+tiny_train_dataset=train_dataset.select(range(10))
+
+
+# Base model
+model = AutoModelForCausalLM.from_pretrained("facebook/opt-350m").to(device)
+
+
+tokenizer = AutoTokenizer.from_pretrained("facebook/opt-350m", padding_side='left')
+
+
+tokenizer.eos_token
+
+
+def formatting_prompts_func(mydataset):
+    output_texts = []
+    for i in range(len(mydataset['instruction'])):
+        text = (
+            f"### Instruction:\n{mydataset['instruction'][i]}"
+            f"\n\n### Response:\n{mydataset['output'][i]}</s>"
+        )
+        output_texts.append(text)
+    return output_texts
+
+def formatting_prompts_func_no_response(mydataset):
+    output_texts = []
+    for i in range(len(mydataset['instruction'])):
+        text = (
+            f"### Instruction:\n{mydataset['instruction'][i]}"
+            f"\n\n### Response:\n"
+        )
+        output_texts.append(text)
+    return output_texts
+
+
+expected_outputs = []
+instructions_with_responses = formatting_prompts_func(test_dataset)
+instructions = formatting_prompts_func_no_response(test_dataset)
+for i in tqdm(range(len(instructions_with_responses))):
+    tokenized_instruction_with_response = tokenizer(instructions_with_responses[i], return_tensors="pt", max_length=1024, truncation=True, padding=False)
+    tokenized_instruction = tokenizer(instructions[i], return_tensors="pt")
+    expected_output = tokenizer.decode(tokenized_instruction_with_response['input_ids'][0][len(tokenized_instruction['input_ids'][0])-1:], skip_special_tokens=True)
+    expected_outputs.append(expected_output)
+
+
+print('############## instructions ##############\n' + instructions[0])
+print('############## instructions_with_responses ##############\n' + instructions_with_responses[0])
+print('\n############## expected_outputs ##############' + expected_outputs[0])
+
+
+class ListDataset(Dataset):
+    def __init__(self, original_list):
+        self.original_list = original_list
+    
+    def __len__(self):
+        return len(self.original_list)
+    
+    def __getitem__(self, i):
+        return self.original_list[i]
+
+instructions_torch = ListDataset(instructions)
+
+
+instructions_torch[0]
+
+
+gen_pipeline = pipeline("text-generation",
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=device,
+                        batch_size=2,
+                        max_length=50,
+                        truncation=True,
+                        padding=False,
+                        return_full_text=False)
+
+
+tokenizer.padding_side = 'left'
+
+with torch.no_grad():
+    # Due to resource limitation, only apply the function on 3 records using "instructions_torch[:10]"
+    pipeline_iterator= gen_pipeline(instructions_torch[:3], 
+                                    max_length=50, # this is set to 50 due to resource constraint, using a GPU, you can increase it to the length of your choice
+                                    num_beams=5,
+                                    early_stopping=True,)
+
+generated_outputs_base = []
+for text in pipeline_iterator:
+    generated_outputs_base.append(text[0]["generated_text"])
+
+
+urlopened = urlopen('https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/VvQRrSqS1P0_GobqtL-SKA/instruction-tuning-generated-outputs-base.pkl')
+generated_outputs_base = pickle.load(io.BytesIO(urlopened.read()))
+
+
+for i in range(3):
+    print('@@@@@@@@@@@@@@@@@@@@')
+    print('@@@@@ Instruction '+ str(i+1) +': ')
+    print(instructions[i])
+    print('\n\n')
+    print('@@@@@ Expected response '+ str(i+1) +': ')
+    print(expected_outputs[i])
+    print('\n\n')
+    print('@@@@@ Generated response '+ str(i+1) +': ')
+    print(generated_outputs_base[i])
+    print('\n\n')
+    print('@@@@@@@@@@@@@@@@@@@@')
+
+
+sacrebleu = evaluate.load("sacrebleu")
+results_base = sacrebleu.compute(predictions=generated_outputs_base,
+                                 references=expected_outputs)
+
+print(list(results_base.keys()))
+print(round(results_base["score"], 1))
+
+
+lora_config = LoraConfig(
+    r=16,  # Low-rank dimension
+    lora_alpha=32,  # Scaling factor
+    target_modules=["q_proj", "v_proj"],  # Modules to apply LoRA
+    lora_dropout=0.1,  # Dropout rate
+    task_type=TaskType.CAUSAL_LM  # Task type should be causal language model
+)
+
+model = get_peft_model(model, lora_config)
+
+
+response_template = "### Response:\n"
+collator = DataCollatorForCompletionOnlyLM(response_template, tokenizer=tokenizer)
+
+
+training_args = SFTConfig(
+    output_dir="/tmp",
+    num_train_epochs=10,
+    save_strategy="epoch",
+    fp16=True,
+    per_device_train_batch_size=2,  # Reduce batch size
+    per_device_eval_batch_size=2,  # Reduce batch size
+    max_seq_length=1024,
+    do_eval=True
+)
+
+trainer = SFTTrainer(
+    model,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
+    formatting_func=formatting_prompts_func,
+    args=training_args,
+    packing=False,
+    data_collator=collator,
+)
+
+
+#trainer.train()
+
+
+#log_history_lora = trainer.state.log_history
+
+
+urlopened = urlopen('https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/49I70jQD0-RNRg2v-eOoxg/instruction-tuning-log-history-lora.json')
+log_history_lora = json.load(io.BytesIO(urlopened.read()))
+
+
+train_loss = [log["loss"] for log in log_history_lora if "loss" in log]
+
+# Plot the training loss
+plt.figure(figsize=(10, 5))
+plt.plot(train_loss, label='Training Loss')
+
+plt.xlabel('Steps')
+plt.ylabel('Loss')
+plt.title('Training Loss')
+plt.legend()
+plt.show()
+
+
+#trainer.save_model("./instruction_tuning_final_model_lora")
+
+
+gen_pipeline = pipeline("text-generation", 
+                        model=model, 
+                        tokenizer=tokenizer, 
+                        device=device, 
+                        batch_size=2, 
+                        max_length=50, 
+                        truncation=True, 
+                        padding=False,
+                        return_full_text=False)
+
+
+with torch.no_grad():
+    # Due to resource limitation, only apply the function on 3 records using "instructions_torch[:10]"
+    pipeline_iterator= gen_pipeline(instructions_torch[:3],
+                                max_length=50, # this is set to 50 due to resource constraint, using a GPU, you can increase it to the length of your choice
+                                num_beams=5,
+                                early_stopping=True,)
+generated_outputs_lora = []
+for text in pipeline_iterator:
+    generated_outputs_lora.append(text[0]["generated_text"])
+
+
+generated_outputs_lora[0]
+
+
+urlopened = urlopen('https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/o7uYxe15xvX4CN-6Lr10iA/instruction-tuning-generated-outputs-lora.pkl')
+generated_outputs_lora = pickle.load(io.BytesIO(urlopened.read()))
+
+
+for i in range(3):
+    print('@@@@@@@@@@@@@@@@@@@@')
+    print('@@@@@ Instruction '+ str(i+1) +': ')
+    print(instructions[i])
+    print('\n\n')
+    print('@@@@@ Expected response '+ str(i+1) +': ')
+    print(expected_outputs[i])
+    print('\n\n')
+    print('@@@@@ Generated response '+ str(i+1) +': ')
+    print(generated_outputs_lora[i])
+    print('\n\n')
+    print('@@@@@@@@@@@@@@@@@@@@')
+
+
+sacrebleu = evaluate.load("sacrebleu")
+results_lora = sacrebleu.compute(predictions=generated_outputs_lora,
+                                 references=expected_outputs)
+print(list(results_lora.keys()))
+print(round(results_lora["score"], 1))
+
+
+def formatting_prompts_response_template(mydataset):
+    output_texts = []
+    for i in range(len(mydataset['instruction'])):
+        text = (
+            f"### Question:\n{mydataset['instruction'][i]}"
+            f"\n\n### Answer:\n{mydataset['output'][i]}</s>"
+        )
+        output_texts.append(text)
+    return output_texts
+
+
+def formatting_prompts_response_template_no_response(mydataset):
+    output_texts = []
+    for i in range(len(mydataset['instruction'])):
+        text = (
+            f"### Question:\n{mydataset['instruction'][i]}"
+            f"\n\n### Answer:\n"
+        )
+        output_texts.append(text)
+    return output_texts
+
+
+model_name = "EleutherAI/gpt-neo-125m"
+
+# Load the model and tokenizer
+model = AutoModelForCausalLM.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+
+lora_config = LoraConfig(
+    r=8,  # Low-rank dimension
+    lora_alpha=16,  # Scaling factor
+    target_modules=["q_proj", "v_proj"],  # Modules to apply LoRA
+    lora_dropout=0.1,  # Dropout rate
+    task_type=TaskType.CAUSAL_LM  # Task type should be causal language model
+)
+
+
+model = get_peft_model(model, lora_config)
